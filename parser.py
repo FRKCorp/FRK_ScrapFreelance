@@ -8,7 +8,7 @@ from database import init_db, is_new, save_project
 
 async def get_projects(max_pages=30):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
 
         await page.set_extra_http_headers({
