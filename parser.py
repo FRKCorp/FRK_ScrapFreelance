@@ -6,6 +6,8 @@ import re
 
 from database import init_db, is_new, save_project
 
+from bot import send_message
+
 async def get_projects(max_pages=30):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -109,8 +111,10 @@ async def get_projects(max_pages=30):
                     number_offer = re.findall(r'\d+', formated_offers)
                     if len(number_offer) > 1:
                         offers = int(number_offer[1])
+                        active = True
                     else:
                         offers = int(number_offer[0])
+                        active = False
 
                 result.append({
                     "id": project_id,
@@ -122,7 +126,7 @@ async def get_projects(max_pages=30):
                     "all_projects": formated_all_projects,
                     "hire_percent": formated_hire_percent,
                     "offers": offers,
-                    "is_active": True
+                    "is_active": active
                 })
 
         await browser.close()
@@ -152,5 +156,5 @@ async def main():
         else:
             print(f"🔄 Обновлён: {p['title']}")
 
-
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,27 @@
+# Секреты
+.env
+tokens.txt
+
+# База данных
+*.db
+*.sqlite
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Python кэш
+__pycache__/
+*.pyc
+*.pyo
+
+# Лишние файлы проекта
+bot_backup.py
+check_free_models.py
+open_router.py
+start.bat
+
+# IDE
+.idea/
+.vscode/
