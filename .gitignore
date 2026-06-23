@@ -17,10 +17,11 @@ __pycache__/
 *.pyo
 
 # Лишние файлы проекта
-bot_backup.py
-check_free_models.py
-open_router.py
-start.bat
+old/bot_backup.py
+old/check_free_models.py
+old/open_router.py
+old/start.bat
+old
 
 # IDE
 .idea/

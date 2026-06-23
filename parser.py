@@ -49,27 +49,23 @@ async def get_projects(max_pages=30):
                 break
 
             for project in projects:
-                # Заголовок и ссылка
                 title_el = project.find("a", href=lambda x: x and "/projects/" in x)
                 title = title_el.text.strip() if title_el else "Без названия"
                 link = "https://kwork.ru" + title_el["href"] if title_el else ""
                 project_id = int(title_el["href"].split("/")[-1])
 
 
-                # Описание
                 desc_el = project.find("div", class_="wants-card__description-text")
                 if desc_el:
-                    # Внутри ищем скрытый блок с полным текстом
                     full_desc = desc_el.find("div", style=lambda s: s and "display: none" in s)
                     if full_desc:
                         desc = full_desc.text.strip()
                     else:
-                        # Если скрытого блока нет — берём обычный (короткое описание)
                         desc = desc_el.text.strip()
                 else:
                     desc = ""
 
-                # Бюджет
+                wanted_budget = -1
                 budget_el = project.find("div", class_="wants-card__price")
 
                 if budget_el:
@@ -77,33 +73,35 @@ async def get_projects(max_pages=30):
                     formated_w_budget = re.search(r'\n\t\t(.*?)\n\t ₽', budget)
                     if formated_w_budget:
                         temp_w_budget = str(formated_w_budget.group(1)).strip().replace(' ', '')
+                        if temp_w_budget.isdigit():
+                            wanted_budget = int(temp_w_budget)
 
-                    wanted_budget = int(temp_w_budget)
-                else:
-                    wanted_budget = -1
-
+                max_budget = -1
                 max_budget_el = project.find("div", class_="wants-card__description-higher-price")
 
                 if max_budget_el:
-                    max_budget = max_budget_el.text.strip()
-                    formated_max_budget = re.search(r'\n\t\t(.*?)\n\t ₽', max_budget)
+                    max_budget_text = max_budget_el.text.strip()
+                    formated_max_budget = re.search(r'\n\t\t(.*?)\n\t ₽', max_budget_text)
                     if formated_max_budget:
                         temp_max_budget = str(formated_max_budget.group(1)).strip().replace(' ', '')
+                        if temp_max_budget.isdigit():
+                            max_budget = int(temp_max_budget)
 
-                    max_budget = int(temp_max_budget)
-                else:
-                    max_budget = -1
-
+                formated_all_projects = 0
+                formated_hire_percent = 0
                 info_el = project.find("div", class_="dib v-align-t")
 
                 if info_el:
-                    all_projects = info_el.text.strip()
-                    formated_info = all_projects.split('Размещено проектов на бирже: ')[1].strip().replace('\n','').replace('\t','')
+                    all_projects_text = info_el.text.strip()
+                    if 'Размещено проектов на бирже: ' in all_projects_text:
+                        formated_info = all_projects_text.split('Размещено проектов на бирже: ')[1].strip().replace('\n','').replace('\t','')
+                        numbers = re.findall(r'\d+', formated_info)
+                        if numbers:
+                            formated_all_projects = int(numbers[0])
+                            formated_hire_percent = int(numbers[-1])
 
-                    numbers = re.findall(r'\d+', formated_info)
-                    formated_all_projects = int(numbers[0])
-                    formated_hire_percent = int(numbers[-1])
-
+                offers = 0
+                active = False
                 offers_el = project.find("div", class_="want-card__informers-row")
 
                 if offers_el:
@@ -112,7 +110,7 @@ async def get_projects(max_pages=30):
                     if len(number_offer) > 1:
                         offers = int(number_offer[1])
                         active = True
-                    else:
+                    elif len(number_offer) == 1:
                         offers = int(number_offer[0])
                         active = False
 
@@ -131,6 +129,73 @@ async def get_projects(max_pages=30):
 
         await browser.close()
         return result
+
+
+async def parse_single_project(url: str) -> dict | None:
+    """
+    Парсит ОДИН заказ по прямой ссылке на его страницу.
+    """
+    match = re.search(r"/projects/(\d+)", url)
+    if not match:
+        return None
+    project_id = int(match.group(1))
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        await page.set_extra_http_headers({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        })
+
+        await page.goto(url, wait_until="networkidle")
+        await page.wait_for_timeout(2000)
+        html = await page.content()
+        await browser.close()
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = "Без названия"
+    og_title = soup.find("meta", property="og:title")
+    if og_title and og_title.get("content"):
+        title = og_title["content"].strip()
+    elif soup.find("h1"):
+        title = soup.find("h1").text.strip()
+
+    description = ""
+    og_desc = soup.find("meta", property="og:description")
+    if og_desc and og_desc.get("content"):
+        description = og_desc["content"].strip()
+
+    page_text = soup.get_text(" ", strip=True)
+    wanted_budget = -1
+    max_budget = -1
+
+    budget_idx = page_text.find("Бюджет")
+    search_zone = page_text[budget_idx:budget_idx + 200] if budget_idx != -1 else page_text
+
+    numbers = [
+        int(n.replace(" ", ""))
+        for n in re.findall(r"(\d[\d\s]{0,9})\s*₽", search_zone)
+        if n.strip()
+    ]
+
+    if numbers:
+        wanted_budget = min(numbers)
+        max_budget = max(numbers)
+
+    return {
+        "id": project_id,
+        "title": title,
+        "link": url,
+        "wanted_budget": wanted_budget,
+        "max_budget": max_budget,
+        "description": description,
+        "all_projects": 0,
+        "hire_percent": 0,
+        "offers": 0,
+        "is_active": True,
+    }
 
 
 async def main():

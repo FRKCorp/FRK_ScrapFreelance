@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import Message, CallbackQuery
 from openai import OpenAI
 import json
@@ -12,7 +13,7 @@ from datetime import datetime
 
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from database import get_projects_by_category
+from database import get_projects_by_category, get_stats, save_project, mark_analyzed
 
 from dotenv import load_dotenv
 import os
@@ -26,6 +27,7 @@ client = OpenAI(
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 MY_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
+PROXY_URL = os.getenv("TELEGRAM_PROXY_URL")
 
 with open("FRK_ANALYZ_PROMT.txt", "r", encoding="utf-8") as f:
     PROMPT = f.read()
@@ -39,11 +41,14 @@ class ViewState(StatesGroup):
     browsing = State()
 
 class SearchState(StatesGroup):
-    waiting_keyword = State()       # ждём ключевое слово
-    filter_category = State()       # выбор категории
-    filter_tag = State()            # выбор тега
-    filter_budget = State()         # ввод бюджета
-    browsing_results = State()      # просмотр результатов
+    waiting_keyword = State()
+    filter_category = State()
+    filter_tag = State()
+    filter_budget = State()
+    browsing_results = State()
+
+class ProcessOrderState(StatesGroup):
+    waiting_link = State()
 
 # ─────────────────────────────────────────────
 # Вспомогательная функция: получить заказ по ID
@@ -81,11 +86,10 @@ def get_project_by_id(project_id: int) -> dict | None:
     }
 
 # ─────────────────────────────────────────────
-# Генерация отклика через Claude Sonnet
+# Генерация отклика через Claude
 # ─────────────────────────────────────────────
 
 def generate_response_text(project: dict) -> dict:
-    """Отправляем заказ в Claude Sonnet и получаем готовый отклик"""
     risks_text = "\n".join(f"- {r}" for r in project["risks"]) if project["risks"] else "Не выявлены"
 
     user_message = (
@@ -98,7 +102,7 @@ def generate_response_text(project: dict) -> dict:
     )
 
     response = client.chat.completions.create(
-        model="anthropic/claude-sonnet-4",   # Claude Sonnet через OpenRouter
+        model="anthropic/claude-sonnet-4.6",
         messages=[
             {"role": "system", "content": RESPONSE_PROMPT},
             {"role": "user",   "content": user_message}
@@ -107,7 +111,6 @@ def generate_response_text(project: dict) -> dict:
 
     raw = response.choices[0].message.content.strip()
 
-    # Чистим markdown-обёртку если модель всё же добавила
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -117,19 +120,39 @@ def generate_response_text(project: dict) -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Пробуем вытащить JSON между { и }
         try:
             start = raw.index("{")
             end = raw.rindex("}") + 1
             return json.loads(raw[start:end])
         except Exception:
-            # Если совсем не распарсилось — возвращаем сырой текст как отклик
             return {
                 "title": project["title"],
                 "response": raw,
                 "price": project["real_price_min"],
                 "deadline_days": project["deadline_days"],
             }
+
+# ─────────────────────────────────────────────
+# Анализ заказа по ссылке
+# ─────────────────────────────────────────────
+
+def analyze_with_claude(project: dict) -> dict:
+    from analyzer import parse_response
+
+    response = client.chat.completions.create(
+        model="anthropic/claude-sonnet-4.6",
+        messages=[
+            {"role": "system", "content": PROMPT},
+            {"role": "user", "content": (
+                f"Заказ:\nНазвание: {project['title']}\n"
+                f"Описание: {project['description']}\n"
+                f"Бюджет заказчика: {project['wanted_budget']} ₽"
+            )}
+        ]
+    )
+
+    raw = response.choices[0].message.content
+    return parse_response(raw)
 
 # ─────────────────────────────────────────────
 # Клавиатуры
@@ -148,7 +171,6 @@ def get_nav_keyboard(index: int, total: int, category: int, project_id: int) -> 
     if nav_row:
         buttons.append(nav_row)
 
-    # Кнопка генерации отклика
     buttons.append([
         InlineKeyboardButton(
             text="✍️ Сгенерировать отклик ✅",
@@ -156,7 +178,6 @@ def get_nav_keyboard(index: int, total: int, category: int, project_id: int) -> 
         )
     ])
 
-    # Служебные кнопки
     buttons.append([
         InlineKeyboardButton(text="📂 Сменить категорию", callback_data="view_categories"),
         InlineKeyboardButton(text="🏠 Меню", callback_data="back_to_menu"),
@@ -210,7 +231,8 @@ def format_project(row, index: int, total: int) -> str:
 # ─────────────────────────────────────────────
 
 async def send_message(project, res_raw):
-    bot = Bot(token=TOKEN)
+    session = AiohttpSession(proxy=PROXY_URL) if PROXY_URL else None
+    bot = Bot(token=TOKEN, session=session)
     try:
         result = res_raw
 
@@ -232,7 +254,6 @@ async def send_message(project, res_raw):
             f"📝 {result['summary']}"
         )
 
-        # Кнопка генерации отклика под каждым уведомлением
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(
@@ -279,7 +300,7 @@ async def cb_open_category(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ViewState.browsing)
     await state.update_data(category=category, index=0, projects=projects)
 
-    project_id = projects[0][0]  # id — первое поле в row
+    project_id = projects[0][0]
     text = format_project(projects[0], 0, len(projects))
     await callback.message.edit_text(
         text,
@@ -325,17 +346,14 @@ async def cb_navigate(callback: CallbackQuery, state: FSMContext):
 async def cb_gen_resp(callback: CallbackQuery):
     project_id = int(callback.data.split("gen_resp_")[1])
 
-    # Показываем индикатор загрузки
     await callback.answer("⏳ Генерирую отклик, подожди...")
     await callback.message.reply("⏳ <b>Генерирую отклик...</b> Обычно занимает 5–15 секунд.", parse_mode="HTML")
 
-    # Получаем данные заказа из БД
     project = get_project_by_id(project_id)
     if not project:
         await callback.message.reply("❌ Заказ не найден в базе.")
         return
 
-    # Генерируем отклик в отдельном потоке (OpenAI клиент синхронный)
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(None, generate_response_text, project)
@@ -490,7 +508,8 @@ async def cb_view_categories(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "process_order")
-async def cb_process_order(callback: CallbackQuery):
+async def cb_process_order(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ProcessOrderState.waiting_link)
     await callback.message.edit_text(
         "🔍 <b>Обработка заказа</b>\n\n"
         "Отправь ссылку на заказ с Kwork и я его проанализирую.\n"
@@ -501,6 +520,102 @@ async def cb_process_order(callback: CallbackQuery):
         ])
     )
     await callback.answer()
+
+
+@dp.message(ProcessOrderState.waiting_link)
+async def handle_process_order_link(message: Message, state: FSMContext):
+    from parser import parse_single_project
+
+    link = message.text.strip()
+
+    if "kwork.ru/projects/" not in link:
+        await message.answer(
+            "❌ Это не похоже на ссылку на заказ Kwork.\n"
+            "Пример: <code>https://kwork.ru/projects/1234567</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    status_msg = await message.answer("⏳ <b>Открываю страницу заказа...</b>", parse_mode="HTML")
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        project_data = await parse_single_project(link)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Не удалось открыть страницу заказа: {e}")
+        await state.clear()
+        return
+
+    if not project_data:
+        await status_msg.edit_text(
+            "❌ Не похоже на ссылку конкретного заказа Kwork.\n"
+            "Нужна ссылка вида <code>https://kwork.ru/projects/1234567</code>",
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+
+    if not project_data["title"] or project_data["title"] == "Без названия":
+        await status_msg.edit_text(
+            "⚠️ Страница открылась, но не удалось вытащить название заказа.\n"
+            "Возможно, заказ уже не активен или Kwork изменил вёрстку страницы."
+        )
+        await state.clear()
+        return
+
+    save_project(project_data)
+
+    await status_msg.edit_text("🧠 <b>Анализирую через Claude Sonnet...</b>", parse_mode="HTML")
+
+    try:
+        result = await loop.run_in_executor(None, analyze_with_claude, project_data)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка анализа: {e}")
+        await state.clear()
+        return
+
+    mark_analyzed(project_data["id"], result)
+
+    risks = result.get("risks", [])
+    risks_text = "\n".join(f"• {r}" for r in risks) if risks else "Не выявлены"
+
+    tags = result.get("tags", [])
+    tags_text = " ".join(f"#{t.replace(' ', '_')}" for t in tags) if tags else "—"
+
+    category_labels = {
+        1: "🏆 Отличный",
+        2: "👍 Хороший",
+        3: "😐 Средний",
+        4: "👎 Слабый",
+        -1: "🚫 Невыполнимый",
+    }
+    category_text = category_labels.get(result.get("category"), str(result.get("category")))
+
+    budget_text = (
+        f"{project_data['wanted_budget']} ₽" if project_data["wanted_budget"] != -1
+        else "не удалось определить"
+    )
+
+    text = (
+        f"📌 <b>{project_data['title']}</b>\n"
+        f"🔗 {project_data['link']}\n\n"
+        f"💰 Бюджет заказчика: {budget_text}\n"
+        f"📊 Реальная стоимость: {result.get('real_price_min', 0)} — {result.get('real_price_max', 0)} ₽\n"
+        f"⏱ Сроки: {result.get('deadline_days', 0)} дней\n"
+        f"🏷 Категория: {category_text}\n\n"
+        f"🔖 {tags_text}\n\n"
+        f"⚠️ Риски:\n{risks_text}\n\n"
+        f"📝 {result.get('summary', '')}"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Сгенерировать отклик ✅", callback_data=f"gen_resp_{project_data['id']}")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="back_to_menu")],
+    ])
+
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await state.clear()
 
 @dp.callback_query(lambda c: c.data == "generate_response")
 async def cb_generate_response(callback: CallbackQuery):
@@ -591,7 +706,7 @@ async def handle_keyword_search(message: Message, state: FSMContext):
     await message.answer(
         f"✅ Найдено заказов: <b>{len(results)}</b> по запросу «{keyword}»\n\n{text}",
         parse_mode="HTML",
-        reply_markup=get_search_nav_keyboard(0, len(results))
+        reply_markup=get_search_nav_keyboard(0, len(results), results[0][0])
     )
 
 
@@ -722,14 +837,14 @@ async def cb_filter_budget(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         f"✅ Найдено заказов: <b>{len(results)}</b>\n\n{text}",
         parse_mode="HTML",
-        reply_markup=get_search_nav_keyboard(0, len(results))
+        reply_markup=get_search_nav_keyboard(0, len(results), results[0][0])
     )
     await callback.answer()
 
 
 # ───────── Навигация в результатах поиска ─────────
 
-def get_search_nav_keyboard(index: int, total: int) -> InlineKeyboardMarkup:
+def get_search_nav_keyboard(index: int, total: int, project_id: int) -> InlineKeyboardMarkup:
     nav_row = []
     if index > 0:
         nav_row.append(InlineKeyboardButton(text="◀️ Пред.", callback_data="sr_prev"))
@@ -739,6 +854,14 @@ def get_search_nav_keyboard(index: int, total: int) -> InlineKeyboardMarkup:
     buttons = []
     if nav_row:
         buttons.append(nav_row)
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="✍️ Сгенерировать отклик ✅",
+            callback_data=f"gen_resp_{project_id}"
+        )
+    ])
+
     buttons.append([
         InlineKeyboardButton(text="🔎 Новый поиск", callback_data="search_orders"),
         InlineKeyboardButton(text="🏠 Меню", callback_data="back_to_menu"),
@@ -760,7 +883,7 @@ async def cb_search_navigate(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(
             text,
             parse_mode="HTML",
-            reply_markup=get_search_nav_keyboard(index, len(results))
+            reply_markup=get_search_nav_keyboard(index, len(results), results[index][0])
         )
     except Exception:
         pass
@@ -772,7 +895,8 @@ async def cb_search_navigate(callback: CallbackQuery, state: FSMContext):
 # ─────────────────────────────────────────────
 
 async def main():
-    bot = Bot(token=TOKEN)
+    session = AiohttpSession(proxy=PROXY_URL) if PROXY_URL else None
+    bot = Bot(token=TOKEN, session=session)
     await bot.send_message(chat_id=MY_CHAT_ID, text="✅ Бот работает!")
 
     text = (

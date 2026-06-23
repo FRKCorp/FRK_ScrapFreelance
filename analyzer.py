@@ -6,6 +6,8 @@ from bot import send_message
 from dotenv import load_dotenv
 import os
 
+load_dotenv()
+
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -15,23 +17,19 @@ with open("FRK_ANALYZ_PROMT.txt", "r", encoding="utf-8") as f:
     PROMPT = f.read()
 
 def parse_response(raw: str) -> dict:
-    """Надёжный парсинг ответа модели"""
     raw = raw.strip()
 
-    # Чистим markdown обёртку
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
     raw = raw.strip()
 
-    # Пробуем парсить как есть
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
 
-    # Если не вышло — пробуем вытащить JSON между первой { и последней }
     try:
         start = raw.index("{")
         end = raw.rindex("}") + 1
@@ -39,7 +37,6 @@ def parse_response(raw: str) -> dict:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Если совсем ничего не помогло — возвращаем дефолт
     print(f"Не удалось распарсить JSON, сырой ответ:\n{raw}")
     return {
         "category": 4,
@@ -52,9 +49,8 @@ def parse_response(raw: str) -> dict:
     }
 
 def analyze_project(project: dict) -> dict:
-    """Отправляем заказ в DeepSeek и получаем результат"""
     response = client.chat.completions.create(
-        model="deepseek/deepseek-chat-v3-0324",
+        model="deepseek/deepseek-v4-flash",
         messages=[
             {"role": "system", "content": PROMPT},
             {"role": "user", "content": f"Заказ:\nНазвание: {project['title']}\nОписание: {project['description']}\nБюджет заказчика: {project['wanted_budget']} ₽"}
@@ -66,7 +62,6 @@ def analyze_project(project: dict) -> dict:
 
 
 async def run_analyzer():
-    """Основной цикл анализа — берём все непроанализированные заказы из БД"""
     rows = get_unanalyzed()
 
     if not rows:
@@ -76,7 +71,6 @@ async def run_analyzer():
     print(f"Найдено непроанализированных заказов: {len(rows)}")
 
     for row in rows:
-        # get_unanalyzed возвращает tuple — преобразуем в dict
         project = {
             "id":           row[0],
             "title":        row[1],
@@ -91,20 +85,16 @@ async def run_analyzer():
 
             result = analyze_project(project)
 
-            # Пишем результат в БД
             mark_analyzed(project["id"], result)
 
-            # Отправляем в Telegram только хорошие заказы (категории 1, 2, 3)
             if result["category"] in [1, 2]:
                 await send_message(project, result)
                 print(f"✅ Отправлен в Telegram: {project['title']} → категория {result['category']}")
             else:
                 print(f"⏭️  Пропущен: {project['title']} → категория {result['category']}")
 
-            # Небольшая пауза между запросами чтобы не словить rate limit
             await asyncio.sleep(3)
 
         except Exception as e:
             print(f"❌ Ошибка анализа [{project['title']}]: {e}")
-            # Не останавливаемся — идём к следующему заказу
             continue
